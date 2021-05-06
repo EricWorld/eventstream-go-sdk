@@ -62,6 +62,16 @@ type KafkaClient struct {
 
 	// mutex to avoid runtime races to access subscribers map
 	lock sync.RWMutex
+
+	writerWrapper map[string]*ConfigWrapper
+
+	brokerConfig *BrokerConfig
+}
+
+type ConfigWrapper struct {
+	writerConfig *kafka.WriterConfig
+	readerConfig *kafka.ReaderConfig
+	Writer       *kafka.Writer
 }
 
 func setConfig(writerConfig *kafka.WriterConfig, readerConfig *kafka.ReaderConfig, config *BrokerConfig) error {
@@ -138,8 +148,9 @@ func newKafkaClient(brokers []string, prefix string, config ...*BrokerConfig) (*
 	var strictValidation bool
 
 	var err error
-
+	var brokerConfig *BrokerConfig
 	if len(config) > 0 {
+		brokerConfig = config[0]
 		err = setConfig(writerConfig, readerConfig, config[0])
 		strictValidation = config[0].StrictValidation
 	}
@@ -150,6 +161,8 @@ func newKafkaClient(brokers []string, prefix string, config ...*BrokerConfig) (*
 		publishConfig:    *writerConfig,
 		subscribeConfig:  *readerConfig,
 		subscribers:      make(map[*SubscribeBuilder]struct{}),
+		writerWrapper:    make(map[string]*ConfigWrapper),
+		brokerConfig:     brokerConfig,
 	}, err
 }
 
@@ -203,6 +216,22 @@ func (client *KafkaClient) Publish(publishBuilder *PublishBuilder) error {
 	return nil
 }
 
+func newWriterWrapper(brokers []string) *ConfigWrapper {
+	writerConfig := &kafka.WriterConfig{
+		Brokers:  brokers,
+		Balancer: &kafka.LeastBytes{},
+	}
+
+	readerConfig := &kafka.ReaderConfig{
+		Brokers:  brokers,
+		MaxBytes: defaultReaderSize,
+	}
+	return &ConfigWrapper{
+		writerConfig: writerConfig,
+		readerConfig: readerConfig,
+	}
+}
+
 // Publish send event to a topic
 func (client *KafkaClient) publishEvent(ctx context.Context, topic, eventName string, config kafka.WriterConfig,
 	message kafka.Message) error {
@@ -210,19 +239,43 @@ func (client *KafkaClient) publishEvent(ctx context.Context, topic, eventName st
 	logrus.Debugf("publish event %s into topic %s", eventName,
 		topicName)
 
-	config.Topic = topicName
-	writer := kafka.NewWriter(config)
+	_, ok := client.writerWrapper[topicName]
+	if !ok {
+		cw := newWriterWrapper(config.Brokers)
+		setConfig(cw.writerConfig, cw.readerConfig, client.brokerConfig)
+		cw.writerConfig.Topic = topicName
+		client.writerWrapper[topicName] = cw
+	}
+	cw := client.writerWrapper[topicName]
+	// config.Topic = topicName
+	// writer := kafka.NewWriter(config)
 
-	defer func() {
-		_ = writer.Close()
-	}()
+	// defer func() {
+	// 	_ = writer.Close()
+	// }()
 
+	// err := writer.WriteMessages(ctx, message)
+	// if err != nil {
+	// 	return err
+	// }
+
+	writer := cw.getWriter()
 	err := writer.WriteMessages(ctx, message)
 	if err != nil {
+		cw.Writer = nil
 		return err
 	}
-
 	return nil
+}
+
+func (cw *ConfigWrapper) getWriter() *kafka.Writer {
+	if cw.Writer != nil {
+		return cw.Writer
+	}
+	writer := kafka.NewWriter(*cw.writerConfig)
+	cw.Writer = writer
+	return cw.Writer
+
 }
 
 // ConstructEvent construct event message
